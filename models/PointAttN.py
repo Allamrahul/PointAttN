@@ -5,10 +5,133 @@ import torch.nn.parallel
 import torch.utils.data
 import torch.nn.functional as F
 import math
+import sys
+# sys.path.insert(0,'/PointFlow/')
+sys.path.insert(0,'/PointAttN/')
 from utils.model_utils import *
 
 from utils.mm3d_pn2 import furthest_point_sample, gather_points
 
+
+
+
+# class MLP_Res(nn.Module):
+class Dynamic_confidence_filter(nn.Module):    
+    def __init__(self, in_dim=128, hidden_dim=None, out_dim=128):
+        super(Dynamic_confidence_filter, self).__init__()
+        if hidden_dim is None:
+            hidden_dim = in_dim
+
+        self.relu = nn.GELU()
+        self.conv_1 = nn.Conv1d(in_dim, hidden_dim, 1)
+        self.conv_2 = nn.Conv1d(hidden_dim, out_dim, 1)
+        self.conv_shortcut = nn.Conv1d(in_dim, out_dim, 1)
+        self.l2_loss = nn.MSELoss()
+
+    def forward(self, fine, gt_points, x2_d, epoch, is_training):
+        """
+        Args:
+            x: (B, out_dim, n)
+        """
+
+        idx = furthest_point_sample(gt_points.contiguous(), fine.size(-1))
+        gt_points_sampled = gather_points(gt_points.transpose(1, 2).contiguous(), idx)
+        
+        fine = fine.transpose(1, 2).contiguous()
+        gt_points_sampled = gt_points_sampled.transpose(1, 2).contiguous()
+
+        dist1, dist2, idx1, idx2=calc_all_dist(fine,gt_points_sampled)
+
+        confidence_score=torch.exp(-dist1)
+
+        confidence_score_predict = self.conv_out3(self.relu(self.conv_out2(self.relu(self.conv_out1(x2_d)))))
+
+        confidence_score_loss=self.l2_loss(confidence_score_predict.squeeze(),confidence_score)
+
+        if epoch<50:
+            alpha1 = 0.01
+            alpha2 = 0.02
+
+            # print(filtered_fine.shape)
+            # exit()
+
+
+            # if is_training==True:
+            #     confidence_score=confidence_score
+            # else:
+            #     confidence_score=confidence_score_predict   
+            # # confidence_score=confidence_score.unsqueeze(-1)
+            # merge_middle_1=torch.cat((fine,confidence_score.unsqueeze(-1)),-1)
+            # merge_middle_1_indices= merge_middle_1[:, :, -1].sort()[1]
+            # merge_middle_1_list=[]
+            # for i in range(fine.size(0)):
+            #     merge_middle_1_list.append([i])
+            # merge_middle_1=merge_middle_1[merge_middle_1_list, merge_middle_1_indices]
+            # # merge_middle_1=merge_middle_1[[[0], [1], [2]], merge_middle_1_indices]
+            # merge_middle_1=merge_middle_1[:,:,0:-1]
+            # # merge_middle_1=merge_middle_1[:,128:,:]
+            # filtered_fine=merge_middle_1[:,128:,:]
+            # print(merge_middle_1.shape)
+            # exit()
+
+            filtered_fine=fine
+        elif epoch<100:
+            alpha1 = 0.05
+            alpha2 = 0.1
+            if is_training==True:
+                confidence_score=confidence_score
+            else:
+                confidence_score=confidence_score_predict   
+            # merge_middle_1=torch.cat((fine,confidence_score.squeeze().unsqueeze(-1)),-1)
+            # merge_middle_1_indices= merge_middle_1[:, :, -1].sort()[1]
+            # merge_middle_1_list=[]
+            # for i in range(fine.size(0)):
+            #     merge_middle_1_list.append([i])
+            # merge_middle_1=merge_middle_1[merge_middle_1_list, merge_middle_1_indices]
+            # # merge_middle_1=merge_middle_1[[[0], [1], [2]], merge_middle_1_indices]
+            # merge_middle_1=merge_middle_1[:,:,0:-1]
+            # # merge_middle_1=merge_middle_1[:,128:,:]
+            # filtered_fine=merge_middle_1[:,128:,:]
+            filtered_fine, confidence_score = sort_pc_according_to_conf(fine, confidence_score)
+
+        else:
+            alpha1 = 0.1
+            alpha2 = 0.2
+            if is_training==True:
+                confidence_score=confidence_score
+            else:
+                confidence_score=confidence_score_predict   
+            # merge_middle_1=torch.cat((fine,confidence_score.squeeze().unsqueeze(-1)),-1)
+            # merge_middle_1_indices= merge_middle_1[:, :, -1].sort()[1]
+            # merge_middle_1_list=[]
+            # for i in range(fine.size(0)):
+            #     merge_middle_1_list.append([i])
+            # merge_middle_1=merge_middle_1[merge_middle_1_list, merge_middle_1_indices]
+            # # merge_middle_1=merge_middle_1[[[0], [1], [2]], merge_middle_1_indices]
+            # merge_middle_1=merge_middle_1[:,:,0:-1]
+            # # merge_middle_1=merge_middle_1[:,128:,:]
+            # filtered_fine=merge_middle_1[:,196:,:]
+            filtered_fine, confidence_score = sort_pc_according_to_conf(fine, confidence_score)
+        return filtered_fine, confidence_score_loss
+
+def sort_pc_according_to_conf(fine_pc, conf_score):
+    """
+        fine_pc - sample shape: torch.randn(batch_sz, 5, 3)
+        conf_score - sample shape = torch.randn(batch_sz, 5)
+
+        return: return shapes same as input shapes
+    """
+    fine_pc = fine_pc.cuda()
+    conf_score = conf_score.cuda()
+
+    fine_sort = torch.FloatTensor(*fine_pc.shape).cuda()
+
+    for x in range(fine_pc.shape[0]):
+        fine_sort[x] = fine_pc[x][conf_score[x].argsort(descending=True)]
+
+    conf_score = torch.sort(conf_score, descending=True)[0]
+
+    return fine_sort, conf_score
 
 class cross_transformer(nn.Module):
 
@@ -136,8 +259,10 @@ class PCT_encoder(nn.Module):
         self.ps_refuse = nn.Conv1d(channel, channel*8, kernel_size=1)
         self.ps_adj = nn.Conv1d(channel*8, channel*8, kernel_size=1)
 
+        self.filtered_corse_pc = Dynamic_confidence_filter(in_dim=256, hidden_dim=128, out_dim=128)
 
-    def forward(self, points):
+    # def forward(self, points):
+    def forward(self, points, gt_points, epoch, is_training):
         batch_size, _, N = points.size()
 
         x = self.relu(self.conv1(points))  # B, D, N
@@ -180,7 +305,15 @@ class PCT_encoder(nn.Module):
 
         fine = self.conv_out(self.relu(self.conv_out1(x2_d)))
 
-        return x_g, fine
+        filtered_fine, confidence_score_loss=self.filtered_corse_pc(fine,gt_points,x2_d,epoch,is_training) 
+        filtered_fine=filtered_fine.transpose(1, 2)
+        # print(fine.shape)
+        # print(filtered_fine.shape)
+        # exit()
+
+        # return x_g, fine
+        return x_g, filtered_fine, confidence_score_loss
+
 
 class Model(nn.Module):
     def __init__(self, args):
@@ -200,9 +333,14 @@ class Model(nn.Module):
         self.refine1 = PCT_refine(ratio=step2)
 
 
-    def forward(self, x, gt=None, is_training=True):
-        feat_g, coarse = self.encoder(x)
-
+    # def forward(self, x, gt=None, is_training=True):
+    def forward(self, x, gt=None, epoch=None, is_training=True):
+        # print(gt.shape)
+        # print(epoch)
+        # exit()
+        # feat_g, coarse = self.encoder(x)
+        feat_g, coarse, confidence_score_loss = self.encoder(x,gt,epoch,is_training)
+        # print(confidence_score_loss)
         new_x = torch.cat([x,coarse],dim=2)
         new_x = gather_points(new_x, furthest_point_sample(new_x.transpose(1, 2).contiguous(), 512))
 
@@ -222,8 +360,11 @@ class Model(nn.Module):
 
             loss1, _ = calc_cd(coarse, gt_coarse)
 
-            total_train_loss = loss1.mean() + loss2.mean() + loss3.mean()
-
+            # confidence_score_loss
+            # total_train_loss = loss1.mean() + loss2.mean() + loss3.mean()
+            total_train_loss = loss1.mean() + loss2.mean() + loss3.mean() + confidence_score_loss
+            # print(total_train_loss)
+            # exit()
             return fine, loss2, total_train_loss
         else:
             cd_p, cd_t = calc_cd(fine1, gt)
